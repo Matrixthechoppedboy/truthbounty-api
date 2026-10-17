@@ -16,7 +16,7 @@
     "pretype-check": "npm run generate:prerequisites",
     "type-check": "tsc --noEmit",
     "prebuild": "npm run generate:prerequisites && npm run type-check",
-    "build": "nest build",
+    "build": "node api.js && nest build",
     "test": "jest",
     "test:watch": "jest --watch",
     "test:cov": "jest --coverage",
