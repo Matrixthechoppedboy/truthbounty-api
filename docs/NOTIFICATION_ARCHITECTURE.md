@@ -5,16 +5,43 @@ The Notification & Event Delivery API serves as the central communication backbo
 
 ## Core Components
 
+### 0. Outbound Webhook Delivery (PREWAVE-BE-059)
+Outbound webhooks are signed, versioned, and idempotent. Every delivery is bound to canonical finalized contract events and to chain/release/artifact provenance; delivery fails closed on stale, ambiguous, unauthorized, or incomplete state.
+
 ### 1. Event Queue
 Built on **BullMQ (Redis)**, ensuring fault-tolerant, asynchronous processing of events.
-- **Queue Name**: `notifications`
+- * *Queue Name**: `notifications`
 - **Retry Mechanism**: Exponential backoff (max 5 attempts, delays starting at 2s, 4s, 8s, 16s).
 
 ### 2. Preference Engine
 Users define their notification preferences (`NotificationPreference` entity):
 - **Channels**: `IN_APP`, `EMAIL`, `PUSH`, `WEBHOOK`
-- **Categories**: `CLAIM`, `VERIFICATION`, `DISPUTEa, `GOVERNANCE`, `REWARD`, etc.
+- **Categories**: `CLAIM`, `VERIFICATION`, `DISPUTE`, `GOVERNANCE`, `REWARD`, etc.
 - **Quiet Hours & Digest Mode**: Settings stored for intelligent delivery windows.
+
+#### Quiet-Hours Timezone Handling
+
+Quiet hours are evaluated as wall-clock `HH:mm` windows in the user's stored
+IANA timezone using the platform's built-in `Intl.DateTimeFormat` — not
+`moment-timezone`, which this service no longer depends on:
+
+- **Zero new runtime dependencies.** Node.js ships full ICU data, so
+  `Intl.DateTimeFormat` resolves any IANA zone with no additional package,
+  keeping the install graph deterministic (see the install-determinism work
+  tracked by #584/#608).
+- **Maintained implementation.** moment is in maintenance mode; the Intl API
+  is maintained by the Node.js project and tracks IANA releases with the
+  runtime.
+- **Deterministic under DST.** Wall-clock minutes are derived per instant from
+  the zone database, so spring-forward and fall-back transitions evaluate
+  consistently (see the DST cases in `preference-enforcer.service.spec.ts`).
+
+Boundary rule (minute granularity): a same-day window `[start, end]` is
+inclusive of both boundary minutes; an overnight window (start > end) covers
+`[start, 24:00) ∪ [00:00, end)`. An invalid timezone falls back to UTC with a
+warning; malformed `HH:mm` values evaluate as not-quiet so delivery is never
+blocked by a timing error. The canonical preference-level boundary rules are
+tracked separately by #616.
 
 ### 3. Delivery Tracking
 The `Notification` entity tracks the lifecycle of every generated event:
@@ -26,6 +53,17 @@ Accessible via `GET /notifications/metrics` to expose:
 - Delivery success rate
 - Total processed notifications
 - Queued / Failed events
+
+Prometheus series are emitted on the shared `GET /metrics` endpoint via
+`prom-client` (no separate metrics library): `notifications_sent_total`,
+`notifications_delivered_total`, `notifications_failed_total`,
+`notifications_retried_total` (labels: `channel`, `event_type`, plus `reason`
+on failures), and `notification_delivery_duration_seconds` (label: `channel`).
+Labels are constrained to closed allow-lists — channel and event type come
+from their canonical enums, and free-text failure reasons are normalized to a
+fixed taxonomy. No user, wallet, email, claim, or secret value ever becomes a
+label. Metrics can be disabled only through the explicit `METRICS_ENABLED`
+mode (default enabled).
 
 ## Event Type Templates
 
@@ -46,3 +84,42 @@ Placeholders are filled from event payloads treated as untrusted input. Values a
 
 ## Future Extensibility
 The modular architecture permits drop-in integrations for SMS, Slack, Discord, Telegram, and AI-generated summaries without modifying the core queue processor.
+
+## Outbound Webhook Contract (PREWAVE-BE-059)
+
+### Envelope
+All outbound webhook payloads use a versioned envelope. The envelope version is stable per event type and bumped only on breaking changes.
+- `version`: envelope schema version (e.g. `v1`).
+- `event`: canonical finalized contract event type.
+- `deliveryId`: stable, deterministic identifier for one logical event (see Idempotency).
+- `timestamp`: Unix epoch seconds at signing time.
+- `provenance`: `{ chainId, releaseId, artifactDigest }` binding the event to chain/release/artifact provenance.
+- `data`: event-specific payload.
+
+### Signature, Timestamp, Delivery ID
+- Every request carries `X-Webhook-Signature`, `X-Webhook-Timestamp`, and `X-Webhook-Delivery-Id` headers.
+- Signature is an HMAC over `version + "." + timestamp + "." + deliveryId + "." + rawBody` using the endpoint's active signing key.
+- Signing keys are versioned and rotatable; the active key ID is sent in `X-Webhook-Key-Id`. Receivers must support overlapping key rotation windows.
+- Receivers verify integrity and reject replays outside the configured timestamp tolerance.
+
+### Idempotency
+- `deliveryId` is derived deterministically from the canonical event identity (event type, chain, release, artifact, and event key) so one logical event always has the same delivery identity across retries.
+- Receivers are expected to deduplicate on `deliveryId`.
+
+### Retry Policy
+- Retries are bounded: max 5 attempts with exponential backoff (2s, 4s, 8s, 16s).
+- Retries reuse the same `deliveryId`; only `timestamp` and signature are refreshed.
+- Retries stop on 2xx. 4xx (except 408/429) are treated as terminal. 5xx, timeouts, and redirects are retried within the bound.
+- Redirects are not followed; a redirect response is treated as a delivery failure.
+
+### Endpoint Validation (SSRF)
+- Endpoints must be HTTPS and resolve to public addresses; loopback, link-local, private, and metadata ranges are rejected.
+- DNS is re-resolved at delivery time to prevent rebinding; unsafe targets are rejected and recorded.
+- Endpoint changes require re-validation before delivery resumes.
+
+### Audit History
+- Every attempt records delivery ID, endpoint, status, latency, response class, key ID, and outcome.
+- Audit history is retained for verification and is queryable per endpoint and per delivery ID.
+
+### Required Tests
+- Receiver timeout, 2xx/4xx/5xx handling, redirect rejection, duplicate delivery, key rotation, SSRF target rejection, and bounded retry behavior.

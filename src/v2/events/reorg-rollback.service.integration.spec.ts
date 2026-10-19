@@ -4,6 +4,7 @@ import { DataSource, Repository } from 'typeorm';
 import { Interface, AbiCoder } from 'ethers';
 import { ReorgRollbackService } from './reorg-rollback.service';
 import { CanonicalEventsService } from './canonical-events.service';
+import { EventQuarantineService } from './event-quarantine.service';
 import { CanonicalEventQueryService } from './canonical-event-query.service';
 import { ArtifactRegistryService } from './artifact-registry.service';
 import { EventDecoderService } from './event-decoder.service';
@@ -121,6 +122,7 @@ describe('ReorgRollbackService (integration)', () => {
         ArtifactRegistryService,
         EventDecoderService,
         CanonicalEventsService,
+        EventQuarantineService,
         CanonicalEventQueryService,
         ReorgRollbackService,
         EvidenceProjectorService,

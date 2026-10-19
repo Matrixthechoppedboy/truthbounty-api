@@ -350,6 +350,134 @@ model ChainEvent {
 }
 
 // ---------------------------------------------------------------------------
+// Feature flags & configuration rollback (PREWAVE-BE-034)
+// ---------------------------------------------------------------------------
+// Feature flags are versioned, compare-and-swap guarded records. Every write
+// must supply the expected version; a mismatch fails closed. Rollback targets
+// are validated against release/schema boundaries before being applied, and
+// every state transition is recorded as an immutable audit event.
+//
+// Security: flags are advisory only. They MUST NOT grant protocol authority
+// (e.g. bypassing canonical contract/finalized event checks). Chain-derived
+// data is bound to chainId + releaseId + deploymentBlock + artifactChecksum.
+// ---------------------------------------------------------------------------
+
+model FeatureFlag {
+  id        String   @id @default(uuid())
+  // Stable, unique flag key (e.g. "v2.indexer.enabled")
+  key       String   @unique
+  description String?
+
+  // Current value as canonical JSON string (never a JS object literal)
+  value     String   @default("false")
+  // Monotonic version used for optimistic concurrency (compare-and-swap)
+  version   Int      @default(1)
+
+  // Release/schema boundary this flag is valid within
+  releaseId        String?
+  schemaVersion    String?
+  chainId          Int?
+  deploymentBlock  BigInt?
+  artifactChecksum String?
+
+  // Lifecycle: active | rolled_back | disabled
+  status    String   @default("active")
+
+  // Actor who last mutated the flag (wallet address or service identity)
+  updatedBy String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  rollbackTargets FeatureFlagRollbackTarget[]
+  auditEvents     FeatureFlagAuditEvent[]
+
+  @@index([status])
+  @@index([releaseId])
+  @@index([chainId])
+  @@index([releaseId, schemaVersion])
+  @@index([key, version])
+}
+
+// A validated, immutable snapshot a flag may be rolled back to. Targets are
+// only created after passing release/schema compatibility checks, so a
+// rollback can never cross an incompatible boundary.
+model FeatureFlagRollbackTarget {
+  id        String   @id @default(uuid())
+
+  flagId String
+  flag   FeatureFlag @relation(fields: [flagId], references: [id], onDelete: Cascade)
+
+  // Snapshot of the flag state at the target version
+  targetVersion Int
+  targetValue   String
+
+  // Boundary binding — must match the flag's release/schema at apply time
+  releaseId        String?
+  schemaVersion    String?
+  chainId          Int?
+  deploymentBlock  BigInt?
+  artifactChecksum String?
+
+  // Validation outcome: valid | invalid | revoked
+  validationStatus String @default("valid")
+  validatedAt      DateTime?
+  validatedBy      String?
+  validationReason String?
+
+  createdAt DateTime @default(now())
+
+  @@unique([flagId, targetVersion])
+  @@index([flagId, validationStatus])
+  @@index([releaseId])
+  @@index([flagId, releaseId, schemaVersion])
+}
+
+// Append-only audit trail for every flag mutation and rollback attempt.
+// Records both successful and rejected transitions so stale/unauthorized
+// attempts remain auditable.
+model FeatureFlagAuditEvent {
+  id        String   @id @default(uuid())
+
+  flagId String
+  flag   FeatureFlag @relation(fields: [flagId], references: [id], onDelete: Cascade)
+
+  // e.g. "update", "rollback", "rollback_rejected", "target_validated"
+  action String
+
+  // Version before/after the transition (null when not applicable)
+  fromVersion Int?
+  toVersion   Int?
+
+  // Actor identity (wallet address or service identity); null if anonymous
+  actorId String?
+  // Whether the actor was authorized for this action
+  actorAuthorized Boolean @default(false)
+
+  // Outcome: applied | rejected | noop
+  outcome String
+  // Machine-readable reason for rejection (e.g. "stale_version")
+  reason  String?
+
+  // Boundary context captured at event time
+  releaseId        String?
+  schemaVersion    String?
+  chainId          Int?
+  deploymentBlock  BigInt?
+  artifactChecksum String?
+
+  // Non-sensitive metadata only (no PII / private payloads)
+  metadata String?
+
+  createdAt DateTime @default(now())
+
+  @@index([flagId, createdAt])
+  @@index([action, outcome])
+  @@index([actorId])
+  @@index([flagId, fromVersion, toVersion])
+}
+
+// ----------------------------------------------------------------------------
 // PREWAVE-BE-079: Secret detection & quarantine for support submissions.
 // Support text/attachments are scanned for seed phrases, private keys,
 // tokens, auth headers, credentials, and protected evidence before
@@ -436,4 +564,84 @@ model DeadLetterReplayAudit {
 
   @@index([replayId, createdAt])
   @@index([actor])
+}
+
+// ----------------------------------------------------------------------------
+// PREWAVE-BE-058: Inbound webhook signature verification & replay protection.
+// Raw signed bytes are preserved so provider-specific HMAC/canonicalization
+// can be recomputed exactly. Delivery-ID uniqueness is enforced at the DB
+// level so replays are rejected transactionally. Secrets are never stored
+// here — only opaque key identifiers for rotation bookkeeping.
+// ----------------------------------------------------------------------------
+
+model WebhookProviderConfig {
+  id        String   @id @default(uuid())
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Provider identifier, e.g. "github", "stripe", "stellar". Unknown
+  // providers must fail closed at the service layer.
+  provider String @unique
+
+  // Timestamp tolerance in seconds for replay-window enforcement.
+  timestampToleranceSeconds Int @default(300)
+
+  // Maximum accepted raw body size in bytes; oversized bodies are rejected
+  // before signature verification.
+  maxBodyBytes Int @default(1048576)
+
+  // Whether this provider is currently active. Inactive providers fail closed.
+  isActive Boolean @default(true)
+
+  // Opaque reference to the current signing secret in the secret store.
+  // Never the secret material itself.
+  activeSecretRef String?
+
+  // JSON array of opaque secret refs retained for rotation grace windows.
+  rotatedSecretRefs String @default("[]")
+
+  deliveries WebhookDelivery[]
+
+  @@index([isActive])
+}
+
+model WebhookDelivery {
+  id        String   @id @default(uuid())
+  createdAt DateTime @default(now())
+
+  // Provider identifier (denormalized for fast lookup / audit).
+  provider String
+
+  // Provider-supplied delivery identifier; uniqueness per provider enforces
+  // transactional replay rejection.
+  deliveryId String
+
+  // Opaque secret ref used to verify this delivery (supports rotation audit).
+  secretRef String?
+
+  // Provider-supplied timestamp (epoch seconds or ISO, provider-specific).
+  // Stored as DateTime for tolerance checks; raw value preserved in headers.
+  eventTimestamp DateTime?
+
+  // SHA-256 of the raw signed body, for integrity and dedup diagnostics.
+  bodySha256 String
+
+  // Size of the raw body in bytes.
+  bodyBytes Int
+
+  // Verification outcome: "accepted" | "rejected". Rejected rows are kept
+  // for audit; accepted rows are the transactional replay guard.
+  status String @default("accepted")
+
+  // Non-sensitive rejection reason (e.g. "bad_signature", "stale_timestamp",
+  // "oversized_body", "unknown_provider"). Never contains secret material.
+  rejectionReason String?
+
+  // Server receipt time used for replay-window and tolerance auditing.
+  receivedAt DateTime @default(now())
+
+  @@unique([provider, deliveryId])
+  @@index([provider, createdAt])
+  @@index([status, createdAt])
+  @@index([provider, receivedAt])
 }

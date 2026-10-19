@@ -2,6 +2,7 @@ import { Test, TestingModule } from '@nestjs/testing';
 import { TypeOrmModule } from '@nestjs/typeorm';
 import { Interface, AbiCoder } from 'ethers';
 import { CanonicalEventsService } from './canonical-events.service';
+import { EventQuarantineService } from './event-quarantine.service';
 import { ArtifactRegistryService } from './artifact-registry.service';
 import { EventDecoderService } from './event-decoder.service';
 import { CanonicalEvent } from './entities/canonical-event.entity';
@@ -86,6 +87,7 @@ describe('CanonicalEventsService (integration)', () => {
         CanonicalEventsService,
         ArtifactRegistryService,
         EventDecoderService,
+        EventQuarantineService,
       ],
     }).compile();
 

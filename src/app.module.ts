@@ -1,3 +1,4 @@
+import { getNestRuntimeConfig } from './config/runtime-config';
 import { Module, Logger } from '@nestjs/common';
 import { ConfigModule, ConfigService } from '@nestjs/config';
 import { EnvironmentValidationService } from './config/environment-validation.service';
@@ -28,6 +29,7 @@ import { CacheModule } from './cache/cache.module';
 import { ClaimsModule } from './claims/claims.module';
 import { ClaimFeedModule } from './claims/v2/claim-feed.module';
 import { ClaimReadModelsModule } from './claims/v2/read-models/claim-read-models.module';
+import { DisputeReadModelsModule } from './v2/disputes/read-models/dispute-read-models.module';
 import { AuditModule } from './audit/audit.module';
 import { ThemeModule } from './theme.module';
 import { SupportModule } from './support/support.module';
@@ -49,6 +51,7 @@ import { V2DisputesModule } from './v2/disputes/v2-disputes.module';
 import { ChainEventsModule } from './v2/chain-events/chain-events.module';
 import { BlockCursorModule } from './v2/block-cursor/block-cursor.module';
 import { V2RewardsModule } from './v2/rewards/v2-rewards.module';
+import { V2StakingModule } from './v2/staking/v2-staking.module';
 import { V2RebuildModule } from './v2/rebuild/v2-rebuild.module';
 import { V2ProjectionModule } from './v2/projection/v2-projection.module';
 import { ProfilerModule } from './profiler/profiler.module';
@@ -63,8 +66,11 @@ import { IndexerModule } from './indexer/indexer.module';
 import { V2OutboxModule } from './v2/outbox/v2-outbox.module';
 import { CredentialRotationModule } from './security/credential-rotation.module';
 import { OperationsModule } from './operations/operations.module';
+import { WebhooksModule } from './webhooks/webhooks.module';
+import { NotificationsModule as OutboundWebhooksNotificationsModule } from './notifications/notifications.module';
 import { AbuseSignalsModule } from './abuse-signals/abuse-signals.module';
 import { AbuseSignalInterceptor } from './abuse-signals/abuse-signal.interceptor';
+import { WebhooksModule } from './webhooks/webhooks.module';
 
 // In-memory storage for development (no Redis needed)
 class ThrottlerMemoryStorage {
@@ -180,11 +186,11 @@ class ThrottlerRedisStorage {
     const blockKey = `${key}:blocked`;
     const [blocked, blockTimeToExpire] = await Promise.all([
       this.redis.exists(blockKey),
-      this.redis.pttl(blockKey),
+      this.redis.ptl(blockKey),
     ]);
 
     if (blocked) {
-      const timeToExpire = await this.redis.pttl(key);
+      const timeToExpire = await this.redis.ptl(key);
       return {
         totalHits: await this.redis
           .get(key)
@@ -195,12 +201,12 @@ class ThrottlerRedisStorage {
       };
     }
 
-    const [totalHits, existingTtl] = await Promise.all([
+    const [totalHits, existingTll] = await Promise.all([
       this.redis.incr(key),
-      this.redis.pttl(key),
+      this.redis.ptl(key),
     ]);
 
-    let timeToExpire = existingTtl;
+    let timeToExpire = existingTll;
     if (timeToExpire === -1 || timeToExpire === -2) {
       await this.redis.pexpire(key, ttl);
       timeToExpire = ttl;
@@ -246,6 +252,9 @@ async function createThrottlerStorage(
       const redis = new Redis({
         host: redisHost,
         port: redisPort,
+        password: configService.get<string>('REDIS_PASSWORD'),
+        db: Number(configService.get('REDIS_DB', 0)),
+        tls: configService.get('REDIS_TLS') === 'true' ? {} : undefined,
         maxRetriesPerRequest: 3,
         lazyConnect: true,
         retryStrategy: (times) => {
@@ -260,9 +269,16 @@ async function createThrottlerStorage(
       await redis.ping();
       return new ThrottlerRedisStorage(redis);
     } catch (error) {
+      if (
+        ['production', 'staging'].includes(
+          configService.get('NODE_ENV', 'development'),
+        )
+      ) {
+        throw new Error('Redis rate-limit storage unavailable');
+      }
       const logger = new Logger('ThrottlerModule');
       logger.warn(
-        `Redis connection failed, falling back to memory storage: ${error}`,
+        `Redis connection failed, falling back to memory storage: ${error} `,
       );
       return new ThrottlerMemoryStorage();
     }
@@ -281,7 +297,9 @@ async function createThrottlerStorage(
         sybilConfig,
         finalityPolicyConfig,
       ],
-      envFilePath: ['.env.local', '.env'],
+      ignoreEnvFile: true,
+      skipProcessEnv: true,
+      validate: () => getNestRuntimeConfig(),
     }),
     FinalityPolicyModule,
     ScheduleModule.forRoot(),
@@ -317,10 +335,11 @@ async function createThrottlerStorage(
       inject: [ConfigService],
       useFactory: (configService: ConfigService) => ({
         connection: {
-          host: configService.get('REDIS_HOST', 'localhost'),
-          port: configService.get('REDIS_PORT', 6379),
-          password: configService.get('REDIS_PASSWORD'),
-          db: configService.get('REDIS_DB', 0),
+          host: configService.get<string>('REDIS_HOST', 'localhost'),
+          port: configService.get<number>('REDIS_PORT', 6379),
+          password: configService.get<string>('REDIS_PASSWORD'),
+          tls: configService.get('REDIS_TLS') === 'true' ? {} : undefined,
+          db: configService.get<number>('REDIS_DB', 0),
         },
       }),
     }),
@@ -343,6 +362,8 @@ async function createThrottlerStorage(
     ClaimFeedModule,
     // PREWAVE-BE-005: versioned claim list/detail read models
     ClaimReadModelsModule,
+    // PREWAVE-BE-007: versioned dispute register/detail read models
+    DisputeReadModelsModule,
     AuditModule,
     ThemeModule,
     SupportModule,
@@ -359,6 +380,7 @@ async function createThrottlerStorage(
     ChainEventsModule,
     BlockCursorModule,
     V2RewardsModule,
+    V2StakingModule,
     V2RebuildModule,
     V2ProjectionModule,
     ProfilerModule,
@@ -367,13 +389,13 @@ async function createThrottlerStorage(
     RealtimeModule,
     StakingModule,
     IndexerModule,
-    // V2-BE-113: TypeORM-side Transactional Outbox
     V2OutboxModule,
     CredentialRotationModule,
+    // UX-BE-004 (#59
     OperationsModule,
-    // PREWAVE-BE-086 (#681): abuse signals. Observe-only until a maintainer
-    // sets ABUSE_SIGNALS_ENFORCEMENT_ENABLED; never protocol authority.
     AbuseSignalsModule,
+    // PREWAVE-BE-058: inbound webhook signature verification
+    WebhooksModule,
   ],
   controllers: [AppController],
   providers: [
@@ -381,11 +403,15 @@ async function createThrottlerStorage(
     EnvironmentValidationService,
     {
       provide: APP_GUARD,
-      useClass: WalletThrottlerGuard,
+      useClass: GlobalAuthGuard,
     },
     {
       provide: APP_GUARD,
-      useClass: GlobalAuthGuard,
+      useClass: IdempotencyGuard,
+    },
+    {
+      provide: APP_INTERCEPTOR,
+      useClass: AuditLoggingInterceptor,
     },
     {
       provide: APP_INTERCEPTOR,
@@ -400,9 +426,6 @@ async function createThrottlerStorage(
       useClass: ProfilerInterceptor,
     },
     {
-      // PREWAVE-BE-086 (#681): records abuse observations on scored routes and
-      // enforces a bounded action only once enforcement has been activated. A
-      // passthrough while ABUSE_SIGNALS_ENFORCEMENT_ENABLED is false.
       provide: APP_INTERCEPTOR,
       useClass: AbuseSignalInterceptor,
     },

@@ -2,7 +2,7 @@ import { Injectable, Logger, Inject, Optional } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { RedisService } from '../redis/redis.service';
 import { REQUEST } from '@nestjs/core';
-import { Request } from 'express';
+import type { Request } from 'express';
 import {
   AuthenticatedRequest,
   isAuthenticatedRequest,
@@ -223,8 +223,16 @@ export class WalletRateLimiterService {
   }
 
   private getEndpointCost(req: Request): number {
+    if (typeof (req as any).rateLimitCost === 'number') {
+      return (req as any).rateLimitCost;
+    }
+
     const path = req.path || '';
     const method = req.method || 'GET';
+
+    if (path.startsWith('/search')) {
+      return this.calculateSearchCost(req);
+    }
 
     for (const endpoint of this.endpointCosts) {
       const pathMatches = typeof endpoint.path === 'string'
@@ -239,6 +247,41 @@ export class WalletRateLimiterService {
     }
 
     return 1;
+  }
+
+  public calculateSearchCost(req: Request): number {
+    const path = req.path || '';
+    const query = (req.query || {}) as Record<string, any>;
+
+    // Global search queries 3 entities, entity-specific queries 1
+    let cost = path === '/search' || path === '/search/' ? 5 : 2;
+
+    const q = typeof query.q === 'string' ? query.q.trim() : '';
+    if (q) {
+      const terms = q.split(/\s+/).filter(Boolean);
+      if (terms.length > 3) {
+        cost += 1;
+      }
+    }
+
+    const limit = query.limit ? Number(query.limit) : 20;
+    if (limit > 50) {
+      cost += 2;
+    } else if (limit > 20) {
+      cost += 1;
+    }
+
+    let filterCount = 0;
+    for (const key of ['status', 'owner', 'walletAddress', 'fromDate', 'toDate', 'finalized']) {
+      if (query[key] !== undefined && query[key] !== '') {
+        filterCount++;
+      }
+    }
+    if (filterCount > 1) {
+      cost += 1;
+    }
+
+    return cost;
   }
 
   private getTierConfig(identity: WalletIdentity): { multiplier: number; burstAllowance: number } {
