@@ -6,9 +6,18 @@ import {
   Param,
   HttpCode,
   HttpStatus,
+  UseGuards,
 } from '@nestjs/common';
-import { ApiTags, ApiOperation, ApiResponse, ApiParam } from '@nestjs/swagger';
+import {
+  ApiTags,
+  ApiOperation,
+  ApiResponse,
+  ApiParam,
+  ApiBearerAuth,
+} from '@nestjs/swagger';
+import { JwtAuthGuard } from '../../auth/jwt-auth.guard';
 import { WorldcoinService } from './worldcoin.service';
+import { WorldcoinVerificationGuard } from './worldcoin-verification.guard';
 import { VerifyWorldcoinDto } from './dto/verify-worldcoin.dto';
 
 @ApiTags('identity/worldcoin')
@@ -16,7 +25,19 @@ import { VerifyWorldcoinDto } from './dto/verify-worldcoin.dto';
 export class WorldcoinController {
   constructor(private readonly worldcoinService: WorldcoinService) {}
 
+  /**
+   * POST /identity/worldcoin/verify
+   *
+   * Submit a Worldcoin ZK proof to establish Sybil-resistant identity.
+   *
+   * Security:
+   *  - Requires a valid JWT (JwtAuthGuard).
+   *  - WorldcoinVerificationGuard ensures body.userId === authenticated principal.
+   *  - Only the owner of an account may submit a proof for that account (IDOR guard).
+   */
   @Post('verify')
+  @UseGuards(JwtAuthGuard, WorldcoinVerificationGuard)
+  @ApiBearerAuth()
   @HttpCode(HttpStatus.OK)
   @ApiOperation({ summary: 'Verify a user using Worldcoin ID' })
   @ApiResponse({
@@ -39,7 +60,13 @@ export class WorldcoinController {
     },
   })
   @ApiResponse({ status: 400, description: 'Invalid proof or request' })
+  @ApiResponse({ status: 401, description: 'Authentication required' })
+  @ApiResponse({ status: 403, description: 'User ID does not match principal' })
   @ApiResponse({ status: 409, description: 'Proof already used' })
+  @ApiResponse({
+    status: 503,
+    description: 'Worldcoin provider temporarily unavailable',
+  })
   async verifyWorldcoin(@Body() verifyDto: VerifyWorldcoinDto) {
     const { userId, proof, action, signal } = verifyDto;
 
@@ -60,6 +87,12 @@ export class WorldcoinController {
     };
   }
 
+  /**
+   * GET /identity/worldcoin/status/:userId
+   *
+   * Check the verification status for a user.  Read-only; publicly accessible
+   * (does not return sensitive proof data).
+   */
   @Get('status/:userId')
   @ApiOperation({ summary: 'Get verification status for a user' })
   @ApiParam({
@@ -102,6 +135,13 @@ export class WorldcoinController {
     };
   }
 
+  /**
+   * GET /identity/worldcoin/verification/:nullifierHash
+   *
+   * Look up a verification record by nullifier hash.
+   * Returns only safe derived fields — raw proof bytes and proofHash are
+   * never returned to API consumers.
+   */
   @Get('verification/:nullifierHash')
   @ApiOperation({ summary: 'Get verification by nullifier hash' })
   @ApiParam({ name: 'nullifierHash', description: 'Nullifier hash to lookup' })
@@ -122,6 +162,7 @@ export class WorldcoinController {
 
     return {
       found: true,
+      // Return only safe derived fields — proofHash is audit-internal.
       verification: {
         id: verification.id,
         userId: verification.userId,

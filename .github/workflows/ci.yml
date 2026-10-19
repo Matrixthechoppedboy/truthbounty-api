@@ -41,7 +41,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
-          node-version: '20'
+          node-version: '22.22.3'
           cache: 'npm'
 
       - name: Install dependencies
@@ -52,6 +52,12 @@ jobs:
 
       - name: Verify toolchain and compiler parity
         run: npm run parity:check
+
+      - name: Runtime configuration documentation drift
+        run: npm run config:check
+
+      - name: Runtime configuration regression tests
+        run: npm test -- --runInBand src/config/runtime-config.spec.ts src/config/runtime-drift.spec.ts src/config/runtime-nest.spec.ts
 
       - name: Type check
         run: npm run type-check
@@ -96,7 +102,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
-          node-version: '20'
+          node-version: '22.22.3'
           cache: 'npm'
 
       # Installed from the lockfile so the audit is evaluated against the exact
@@ -104,38 +110,39 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      # Canonical dependency scanner. `pipefail` keeps npm's non-zero exit on a
-      # high-or-critical finding, so this step still fails the workflow. The
-      # report is written to a file and uploaded below as retained evidence.
-      - name: Dependency audit (npm audit)
+      - name: Test security evidence generation
+        run: npm run test:security-evidence
+
+      - name: Build image for security evidence
         run: |
-          set -o pipefail
-          npm audit --audit-level=high 2>&1 | tee npm-audit-report.txt
+          metadata_file="$(mktemp)"
+          trap 'rm -f "$metadata_file"' EXIT
+          docker buildx build --load --metadata-file "$metadata_file" \
+            -t truthbounty-api:security-evidence .
+          image_digest="$(jq -er '."containerimage.digest" | select(test("^sha256:[a-f0-9]{64}$"))' "$metadata_file")"
+          if [[ ! "$image_digest" =~ ^sha256:[a-f0-9]{64}$ ]]; then
+            echo "::error::Could not determine the reviewed container image digest."
+            exit 1
+          fi
+          echo "CONTAINER_IMAGE_DIGEST=$image_digest" >> "$GITHUB_ENV"
 
-      # `if: always()` only ensures the evidence is retained when the audit step
-      # fails; it does not suppress the failure. See docs/DEPENDENCY_SECURITY.md.
-      - name: Publish dependency audit evidence
-        if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: npm-audit-report
-          path: npm-audit-report.txt
-          if-no-files-found: error
-          retention-days: 90
-
+      # SBOM and audit execute in the same script, but neither result masks the
+      # other. The script exits non-zero for audit findings only after evidence
+      # and checksums have been written.
       - name: Generate SBOM and run dependency audit
         run: npm run security:dependencies
 
-      - name: Upload dependency SBOM
+      - name: Upload immutable dependency security evidence
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: dependency-sbom-${{ github.sha }}
-          path: artifacts/dependency-sbom.cdx.json
+          name: dependency-security-evidence-${{ github.sha }}
+          path: artifacts/
           if-no-files-found: error
-          retention-days: 14
+          retention-days: 90
 
       - name: Secret scanning (TruffleHog)
+        if: always()
         uses: trufflesecurity/trufflehog@4dd8831c5f12599465d4d45c3c447b4018a34c85 # v3.97.9
         with:
           path: ./
@@ -143,11 +150,13 @@ jobs:
           head: HEAD
 
       - name: Initialize CodeQL
+        if: always()
         uses: github/codeql-action/init@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
         with:
           languages: javascript-typescript
 
       - name: Perform CodeQL Analysis
+        if: always()
         uses: github/codeql-action/analyze@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
         with:
           category: "/language:javascript-typescript"
@@ -161,19 +170,59 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: '22.22.3'
+
       - name: Build Docker image
         continue-on-error: false
-        run: docker build -t truthbounty-api:test .
+        run: |
+          metadata_file="$(mktemp)"
+          trap 'rm -f "$metadata_file"' EXIT
+          docker buildx build --load --metadata-file "$metadata_file" \
+            -t truthbounty-api:test .
+          image_digest="$(jq -er '."containerimage.digest" | select(test("^sha256:[a-f0-9]{64}$"))' "$metadata_file")"
+          echo "CONTAINER_IMAGE_DIGEST=$image_digest" >> "$GITHUB_ENV"
 
       - name: Run Trivy vulnerability scanner
         uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8 # v0.36.0
         with:
           image-ref: 'truthbounty-api:test'
-          format: 'table'
+          format: 'json'
+          output: 'trivy-results.json'
           exit-code: '1'
           ignore-unfixed: true
           vuln-type: 'os,library'
           severity: 'CRITICAL,HIGH'
+
+      - name: Create container scan attestation
+        if: always()
+        run: |
+          node_version="$(node --version)"
+          npm_version="$(npm --version)"
+          lockfile_sha256="$(sha256sum package-lock.json | cut -d ' ' -f 1)"
+          report_sha256="$(sha256sum trivy-results.json | cut -d ' ' -f 1)"
+          jq -n \
+            --arg commit "$GITHUB_SHA" \
+            --arg lockfileSha256 "$lockfile_sha256" \
+            --arg nodeVersion "$node_version" \
+            --arg npmVersion "$npm_version" \
+            --arg containerImageDigest "$CONTAINER_IMAGE_DIGEST" \
+            --arg trivyReportSha256 "$report_sha256" \
+            '{commit:$commit, lockfileSha256:$lockfileSha256, nodeVersion:$nodeVersion, npmVersion:$npmVersion, containerImageDigest:$containerImageDigest, trivyReportSha256:$trivyReportSha256}' \
+            > container-scan-metadata.json
+
+      - name: Upload immutable container scan evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: container-scan-evidence-${{ github.sha }}
+          path: |
+            trivy-results.json
+            container-scan-metadata.json
+          if-no-files-found: error
+          retention-days: 90
 
   sensitive-changes-protection:
     name: Sensitive Changes Protection

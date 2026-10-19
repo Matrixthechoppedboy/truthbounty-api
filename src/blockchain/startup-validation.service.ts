@@ -8,6 +8,11 @@ import {
   ReleaseManifestContract,
   ReleaseManifestAdapter,
 } from '../config/release-manifest.adapter';
+import {
+  RealtimeConfig,
+  RealtimeTopicDefinition,
+} from './types';
+import { RealtimeConfigService } from './realtime-config.service';
 
 /**
  * Result of validating a single contract config at startup.
@@ -35,6 +40,16 @@ export interface ReleaseManifestValidationResult {
  */
 export type EnvironmentMode = 'local' | 'development' |
   'test' | 'staging' | 'production';
+
+/**
+ * Result of validating the realtime configuration at startup.
+ */
+export interface RealtimeConfigValidationResult {
+  valid: boolean;
+  errors: string[];
+  topics: RealtimeTopicDefinition[];
+  config?: RealtimeConfig;
+}
 
 /**
  * Readiness status separated from liveness and startup.
@@ -117,6 +132,12 @@ export interface ReadinessPolicy {
  * required release data is absent or inconsistent, and keeps local dev
  * explicit and visibly non-production.
  *
+ * PREWAVE-BE-035 extends this to validate the realtime configuration
+ * (stream origins, topics, retention, heartbeat, payload limits, supported
+ * release) and to authorize subscription topics per principal/capability.
+ * Invalid realtime config fails startup/readiness and topic names cannot
+ * inject Redis/WebSocket patterns.
+ *
  * PREWAVE-BE-044 extends this with runtime readiness observations: observed
  * time, last success, chain head/finalized block, projection lag,
  * release and per-dependency provenance. Liveness, startup, readiness and
@@ -145,6 +166,7 @@ export class StartupValidationService {
   constructor(
     private readonly configService: ConfigService,
     private readonly releaseManifestAdapter: ReleaseManifestAdapter,
+    private readonly realtimeConfigService: RealtimeConfigService,
   ) {}
 
   /**
@@ -170,7 +192,7 @@ export class StartupValidationService {
     const contracts = this.getContracts();
     if (contracts.length === 0 && !isLocal) {
       errors.push(
-        'INDEXED_CONTRACTS, is empty; indexer configuration cannot start outside explicit local mode',
+        'INDEXED_CONTRACTS is empty; indexer configuration cannot start outside explicit local mode',
       );
     }
     for (const contract of contracts) {
@@ -187,7 +209,11 @@ export class StartupValidationService {
       errors.push(...this.validateManifestConsistency(envManifest, contracts));
     }
 
-    // 4. Network-backed checks.
+    // 4. Realtime configuration validation (fail-closed outside local).
+    const realtimeResult = this.validateRealtimeConfig(isLocal);
+    errors.push(...realtimeResult.errors);
+
+    // 5. Network-backed checks.
     if (this.configService.get('BLOCKCHAIN_STARTUP_RPC_CHECK') !== 'false') {
       errors.push(...(await this.validateChainAndCode(contracts)));
     }
@@ -203,7 +229,7 @@ export class StartupValidationService {
     this.startupCompletedAt = Date.now();
     const releaseId = envManifest?.releaseId ?? 'unknown';
     this.logger.log(
-      `Blockchain startup validation passed (release=${releaseId}, ${contracts.length} contracts, ABI/address checks ok)`,
+      `Blockchain startup validation passed (release=${releaseId}, ${contracts.length} contracts, ABI/address checks ok, ${realtimeResult.topics.length} realtime topics)`,
     );
   }
 
@@ -216,7 +242,7 @@ export class StartupValidationService {
 
     if (!contract.address) {
       errors.push('missing address');
-    } else if (!/^0x[aA-fA-F0-9]{40}$/.test(contract.address)) {
+    } else if (!/^0x[a-fA-F0-9]{40}$/.test(contract.address)) {
       errors.push(`address "${contract.address}" is not a valid 20-byte hex`);
     } else {
       try {
@@ -326,9 +352,24 @@ export class StartupValidationService {
   }
 
   /**
-   * Validate that the release manifest and the contract config agree.
+   * Validate realtime configuration (stream origins, topics, retention,
+   * heartbeat, payload limits, supported release). Fails closed outside
+   * local mode.
    */
-  validateManifestConsistency(
+  validateRealtimeConfig(isLocal: boolean): RealtimeConfigValidationResult {
+    const result = this.realtimeConfigService.validate({ isLocal });
+    return {
+      valid: result.valid,
+      errors: result.errors,
+      topics: result.config?.topics ?? [],
+      config: result.config,
+    };
+  }
+
+  /**
+   * Validate release manifest <-> contract config consistency.
+   */
+  private validateManifestConsistency(
     manifest: CanonicalReleaseManifest,
     contracts: ContractConfig[],
   ): string[] {
@@ -363,7 +404,6 @@ export class StartupValidationService {
         );
       }
     }
-
     return errors;
   }
 

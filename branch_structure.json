@@ -1,0 +1,18 @@
+{
+  "default_branch": "main",
+  "branches": [
+    "main",
+    "origin",
+    "security/issue-643-prewave-be-049-authorize-and-make-dead-letter"
+  ],
+  "parent": {
+    "main": null,
+    "origin": "main",
+    "security/issue-643-prewave-be-049-authorize-and-make-dead-letter": "main"
+  },
+  "order": [
+    "main",
+    "origin",
+    "security/issue-643-prewave-be-049-authorize-and-make-dead-letter"
+  ]
+}

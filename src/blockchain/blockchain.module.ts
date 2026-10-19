@@ -20,6 +20,10 @@ import { ReadinessService } from './readiness.service';
 import { DependencyProvenanceService } from './dependency-provenance.service';
 import { AdminAuditModule } from '../audit/admin-audit.module';
 import { DeadLetterReplayService } from './dead-letter-replay.service';
+import { WebhookSignatureService } from './webhook-signature.service';
+import { WebhookReplayGuardService } from './webhook-replay-guard.service';
+import { WebhookDeliveryEntity } from './entities/webhook-delivery.entity';
+import { WebhookController } from './webhook.controller';
 
 @Module({
   imports: [
@@ -28,6 +32,7 @@ import { DeadLetterReplayService } from './dead-letter-replay.service';
       TokenBalance,
       IndexerCheckpoint,
       DeadLetterReplay,
+      WebhookDeliveryEntity,
     ]),
     SybilResistanceModule,
     AdminAuditModule,
@@ -43,8 +48,11 @@ import { DeadLetterReplayService } from './dead-letter-replay.service';
     StartupValidationService,
     DeterministicRpcFailoverService,
     DeadLetterReplayService,
+    WeightedVoteResolutionService,
+    WebhookSignatureService,
+    WebhookReplayGuardService,
   ],
-  controllers: [BlockchainController],
+  controllers: [BlockchainController, WebhookController],
   exports: [
     BlockchainIndexerService,
     BlockchainStateService,
@@ -55,6 +63,9 @@ import { DeadLetterReplayService } from './dead-letter-replay.service';
     EventIndexingService,
     DeterministicRpcFailoverService,
     DeadLetterReplayService,
+    WeightedVoteResolutionService,
+    WebhookSignatureService,
+    WebhookReplayGuardService,
   ],
 })
 export class BlockchainModule {}

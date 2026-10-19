@@ -29,6 +29,17 @@ export class MetricsService {
   private readonly blockchainLagGauge: Gauge<string>;
   private readonly blockchainLastIndexedBlockGauge: Gauge<string>;
 
+  // Database pool monitoring (PREWAVE-BE-056): pool saturation, acquisition
+  // timeouts, statement timeouts, and per-workload budget rejections. All
+  // label sets are closed enums so metric cardinality stays bounded.
+  private readonly dbPoolTotalGauge: Gauge<string>;
+  private readonly dbPoolIdleGauge: Gauge<string>;
+  private readonly dbPoolActiveGauge: Gauge<string>;
+  private readonly dbPoolWaitingGauge: Gauge<string>;
+  private readonly dbPoolAcquisitionTimeoutsCounter: Counter<string>;
+  private readonly dbPoolStatementTimeoutsCounter: Counter<string>;
+  private readonly dbPoolBudgetRejectedCounter: Counter<string>;
+
   // Lazily-registered domain counters (outbox, notifications, ...) so that
   // services can record business events without pre-declaring each metric.
   private readonly customCounters = new Map<string, Counter<string>>();
@@ -79,6 +90,44 @@ export class MetricsService {
     this.blockchainLastIndexedBlockGauge = new Gauge({
       name: 'blockchain_last_indexed_block',
       help: 'The most recent block number processed by the indexer',
+    });
+
+    this.dbPoolTotalGauge = new Gauge({
+      name: 'db_pool_connections_total',
+      help: 'Total connections currently established by the database pool',
+    });
+
+    this.dbPoolIdleGauge = new Gauge({
+      name: 'db_pool_connections_idle',
+      help: 'Idle (available) connections in the database pool',
+    });
+
+    this.dbPoolActiveGauge = new Gauge({
+      name: 'db_pool_connections_active',
+      help: 'Active (checked-out) connections in the database pool',
+    });
+
+    this.dbPoolWaitingGauge = new Gauge({
+      name: 'db_pool_waiting',
+      help: 'Callers currently waiting for a free database connection',
+    });
+
+    this.dbPoolAcquisitionTimeoutsCounter = new Counter({
+      name: 'db_pool_acquisition_timeouts_total',
+      help: 'Total database connection acquisitions that timed out',
+      labelNames: ['workload'],
+    });
+
+    this.dbPoolStatementTimeoutsCounter = new Counter({
+      name: 'db_pool_statement_timeouts_total',
+      help: 'Total database statements cancelled by statement_timeout',
+      labelNames: ['workload'],
+    });
+
+    this.dbPoolBudgetRejectedCounter = new Counter({
+      name: 'db_pool_budget_rejected_total',
+      help: 'Total database requests rejected because a workload budget was exhausted',
+      labelNames: ['workload'],
     });
   }
 
@@ -224,6 +273,59 @@ export class MetricsService {
     }
   }
 
+  /**
+   * Records database pool utilization (PREWAVE-BE-056).
+   *
+   * Every value is clamped to a finite, non-negative integer before being
+   * written, so a malformed driver reading can never push NaN or Infinity
+   * into Prometheus. Callers should pass the output of
+   * `DatabaseService.getBoundedPoolMetrics()`.
+   */
+  setDbPoolStats(stats: {
+    total: number;
+    idle: number;
+    active: number;
+    waiting: number;
+  }): void {
+    this.dbPoolTotalGauge.set(clampMetric(stats.total));
+    this.dbPoolIdleGauge.set(clampMetric(stats.idle));
+    this.dbPoolActiveGauge.set(clampMetric(stats.active));
+    this.dbPoolWaitingGauge.set(clampMetric(stats.waiting));
+  }
+
+  /**
+   * Increments the database connection-acquisition timeout counter.
+   * `workload` must be one of the closed workload enum values; unknown
+   * values are coerced to `default` so label cardinality stays bounded.
+   */
+  incrementDbAcquisitionTimeout(workload: string): void {
+    this.dbPoolAcquisitionTimeoutsCounter.inc({
+      workload: sanitizeWorkload(workload),
+    });
+  }
+
+  /**
+   * Increments the database statement-timeout counter (a statement was
+   * cancelled by PostgreSQL's `statement_timeout`). `workload` is coerced
+   * to the closed workload enum.
+   */
+  incrementDbStatementTimeout(workload: string): void {
+    this.dbPoolStatementTimeoutsCounter.inc({
+      workload: sanitizeWorkload(workload),
+    });
+  }
+
+  /**
+   * Increments the per-workload budget-rejection counter (a request was
+   * refused because the workload's connection budget was exhausted).
+   * `workload` is coerced to the closed workload enum.
+   */
+  incrementDbBudgetRejected(workload: string): void {
+    this.dbPoolBudgetRejectedCounter.inc({
+      workload: sanitizeWorkload(workload),
+    });
+  }
+
   async getMetrics() {
     return await register.metrics();
   }
@@ -240,4 +342,30 @@ export class MetricsService {
       statusCodes: Object.fromEntries(this.statusCodes),
     };
   }
+}
+
+/**
+ * Closed enum of workload names accepted as metric labels. Keeping this set
+ * fixed guarantees `db_pool_*` metric cardinality cannot grow with
+ * user-supplied input.
+ */
+const KNOWN_WORKLOADS = new Set(['api', 'jobs', 'admin', 'default']);
+
+/**
+ * Clamps a metric value to a finite, non-negative integer so NaN, Infinity,
+ * or negative readings can never be written into Prometheus.
+ */
+function clampMetric(value: unknown): number {
+  const n = typeof value === 'number' ? value : Number(value);
+  if (!Number.isFinite(n) || n < 0) return 0;
+  return Math.floor(n);
+}
+
+/**
+ * Coerces an arbitrary workload string to the closed enum, defaulting to
+ * `default` for unknown values (bounded label cardinality).
+ */
+function sanitizeWorkload(workload: string): string {
+  const w = String(workload ?? '').toLowerCase();
+  return KNOWN_WORKLOADS.has(w) ? w : 'default';
 }

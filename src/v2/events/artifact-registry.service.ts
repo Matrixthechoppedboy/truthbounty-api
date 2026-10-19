@@ -10,6 +10,17 @@ export interface ResolvedArtifact {
   iface: Interface;
 }
 
+/** Discriminated artifact resolution, used to classify quarantine failures. */
+export type ArtifactResolution =
+  | {
+      status: 'ok';
+      artifactVersion: string;
+      iface: Interface;
+      abiChecksum: string;
+    }
+  | { status: 'unregistered' }
+  | { status: 'invalid_artifact'; detail: string };
+
 /**
  * Resolves the approved ABI for a (chainId, contractAddress) pair.
  *
@@ -115,6 +126,59 @@ export class ArtifactRegistryService {
 
   private isSupportedChain(chainId: number): boolean {
     return chainId === 10 || chainId === 11155420;
+  }
+
+  /**
+   * Resolve an artifact with a discriminated result, so callers can tell an
+   * unknown address (`unregistered`) from an approved row that failed validation
+   * (`invalid_artifact`, i.e. an ABI mismatch). Used to classify quarantine.
+   */
+  async resolveDetailed(
+    chainId: number,
+    contractAddress: string,
+  ): Promise<ArtifactResolution> {
+    const resolved = await this.resolve(chainId, contractAddress);
+    if (resolved) {
+      const row = await this.artifacts.findOne({
+        where: {
+          chainId,
+          contractAddress: contractAddress.trim().toLowerCase(),
+          isApproved: true,
+        },
+      });
+      const abiChecksum = row
+        ? crypto
+            .createHash('sha256')
+            .update(JSON.stringify(row.abi))
+            .digest('hex')
+        : '';
+      return {
+        status: 'ok',
+        artifactVersion: resolved.artifactVersion,
+        iface: resolved.iface,
+        abiChecksum,
+      };
+    }
+
+    if (
+      !Number.isInteger(chainId) ||
+      !this.isSupportedChain(chainId) ||
+      typeof contractAddress !== 'string' ||
+      !this.isEvmAddress(contractAddress.trim())
+    ) {
+      return { status: 'unregistered' };
+    }
+
+    const row = await this.artifacts.findOne({
+      where: { chainId, contractAddress: contractAddress.trim().toLowerCase() },
+    });
+    if (!row) return { status: 'unregistered' };
+    return {
+      status: 'invalid_artifact',
+      detail: row.isApproved
+        ? 'approved artifact failed checksum/ABI validation'
+        : 'artifact exists but is not approved',
+    };
   }
 
   private isEvmAddress(address: string): boolean {

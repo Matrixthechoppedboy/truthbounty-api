@@ -4,7 +4,8 @@ import { Repository } from 'typeorm';
 import { NotificationPreference } from '../entities/notification-preference.entity';
 import { DeliveryChannel } from '../interfaces/notification.types';
 import { EventType } from '../enums/event-type.enum';
-import * as moment from 'moment-timezone';
+
+const QUIET_HOURS_TIME_PATTERN = /^([01]\d|2[0-3]):([0-5]\d)$/;
 
 /**
  * PreferenceEnforcer
@@ -38,17 +39,15 @@ export class PreferenceEnforcer {
       // Create defaults
       pref = this.preferenceRepository.create({
         userId,
-        channels: {
-          [DeliveryChannel.IN_APP]: true,
-          [DeliveryChannel.EMAIL]: true,
-          [DeliveryChannel.PUSH]: false,
-          [DeliveryChannel.WEBHOOK]: false,
-          [DeliveryChannel.WEBSOCKET]: true,
-        },
+        channels: createDefaultChannelPreferences(),
         categorySubscriptions: {},
         language: 'en',
       });
       pref = await this.preferenceRepository.save(pref);
+    }
+
+    if (pref.channels) {
+      pref.channels = normalizeChannelPreferences(pref.channels);
     }
 
     return pref;
@@ -57,9 +56,17 @@ export class PreferenceEnforcer {
   /**
    * Check if a channel is enabled for a user
    */
-  async isChannelEnabled(userId: string, channel: DeliveryChannel): Promise<boolean> {
+  async isChannelEnabled(
+    userId: string,
+    channel: DeliveryChannel | string,
+  ): Promise<boolean> {
+    const canonical = parseDeliveryChannel(channel);
+    if (!canonical) {
+      return false; // Unknown or null channel fails closed
+    }
     const pref = await this.getPreferences(userId);
-    return pref.channels?.[channel] ?? false;
+    const normalized = normalizeChannelPreferences(pref.channels);
+    return normalized[canonical] ?? false;
   }
 
   /**
@@ -96,65 +103,96 @@ export class PreferenceEnforcer {
     }
 
     try {
-      const userTz = timezone || 'UTC';
-      const now = moment().tz(userTz);
+      const start = this.parseQuietHoursTime(startTime);
+      const end = this.parseQuietHoursTime(endTime);
 
-      const start = moment.tz(startTime, 'HH:mm', userTz);
-      const end = moment.tz(endTime, 'HH:mm', userTz);
-
-      // Handle overnight quiet hours (e.g., 22:00 - 08:00)
-      if (start.isAfter(end)) {
-        return now.isAfter(start) || now.isBefore(end);
+      if (start === null || end === null) {
+        this.logger.warn(
+          `Invalid quiet hours time for user ${userId}: ${startTime}-${endTime}`,
+        );
+        return false;
       }
 
-      return now.isBetween(start, end, undefined, '[]');
+      let nowMinutes: number;
+      try {
+        nowMinutes = this.getMinutesOfDay(new Date(), timezone || 'UTC');
+      } catch {
+        const fallbackTz = 'UTC';
+        this.logger.warn(
+          `Invalid quiet hours timezone '${timezone}' for user ${userId}, falling back to ${fallbackTz}`,
+        );
+        nowMinutes = this.getMinutesOfDay(new Date(), fallbackTz);
+      }
+
+      // Handle overnight quiet hours (e.g., 22:00 - 08:00)
+      if (start > end) {
+        return nowMinutes >= start || nowMinutes < end;
+      }
+
+      return nowMinutes >= start && nowMinutes <= end;
     } catch (error) {
-      this.logger.warn(`Failed to check quiet hours for user ${userId}: ${error.message}`);
-      return false; // Don't block delivery on timing errors
+      this.logger.error(`Error calculating quiet hours: ${error.message}`);
+      return false; // Default to allowing notifications if timezone invalid
     }
   }
 
+  private parseQuietHoursTime(value: string): number | null {
+    const match = QUIET_HOURS_TIME_PATTERN.exec(value);
+    if (!match) {
+      return null;
+    }
+    return parseInt(match[1], 10) * 60 + parseInt(match[2], 10);
+  }
+
+  private getMinutesOfDay(date: Date, timeZone: string): number {
+    const parts = new Intl.DateTimeFormat('en-US', {
+      timeZone,
+      hourCycle: 'h23',
+      hour: '2-digit',
+      minute: '2-digit',
+    }).formatToParts(date);
+
+    const hourPart = parts.find((part) => part.type === 'hour');
+    const minutePart = parts.find((part) => part.type === 'minute');
+
+    const hour = Number(hourPart?.value);
+    const minute = Number(minutePart?.value);
+
+    if (!Number.isFinite(hour) || !Number.isFinite(minute)) {
+      throw new Error(
+        `Unable to read wall-clock time in timezone '${timeZone}'`,
+      );
+    }
+
+    return (hour % 24) * 60 + minute;
+  }
+
   /**
-   * Check if digest mode is enabled
+   * Check if digest mode is enabled for a user
    */
-  async isDigestModeEnabled(userId: string): Promise<boolean> {
+  async isDigestEnabled(userId: string): Promise<boolean> {
     const pref = await this.getPreferences(userId);
     return pref.digestPreferences?.enabled ?? false;
   }
 
   /**
-   * Get digest delivery time for user
-   * Returns HH:mm format
+   * Check if user has exceeded rate limit for notifications
    */
-  async getDigestDeliveryTime(userId: string): Promise<string> {
-    const pref = await this.getPreferences(userId);
-    return pref.digestPreferences?.deliveryTime ?? '09:00';
-  }
-
-  /**
-   * Get digest frequency
-   */
-  async getDigestFrequency(userId: string): Promise<'DAILY' | 'WEEKLY'> {
-    const pref = await this.getPreferences(userId);
-    return pref.digestPreferences?.frequency ?? 'DAILY';
-  }
-
-  /**
-   * Check if user has hit daily notification cap
-   */
-  async canDeliverNotification(userId: string, channel: DeliveryChannel): Promise<boolean> {
+  async canDeliverNotification(
+    userId: string,
+    channel: DeliveryChannel,
+  ): Promise<boolean> {
     const pref = await this.getPreferences(userId);
 
-    // Check channel-specific limits
-    if (channel === DeliveryChannel.EMAIL && pref.maxEmailsPerDay) {
-      // TODO: Query delivery history for today
-      // If count >= maxEmailsPerDay, return false
+    // Check overall max per day
+    if (pref.maxNotificationsPerDay) {
+      // In production, would query notification history count for today
+      // For now, allow (rate limiting counter would be in Redis)
     }
 
-    // Check general notification limit
-    if (pref.maxNotificationsPerDay) {
-      // TODO: Query delivery history for today
-      // If count >= maxNotificationsPerDay, return false
+    // Check email-specific cap
+    if (channel === DeliveryChannel.EMAIL && pref.maxEmailsPerDay) {
+      // Check email count today
     }
 
     return true;
@@ -167,8 +205,12 @@ export class PreferenceEnforcer {
     userId: string,
     updates: Partial<NotificationPreference>,
   ): Promise<NotificationPreference> {
-    let pref = await this.getPreferences(userId);
+    const pref = await this.getPreferences(userId);
+    if (updates.channels) {
+      updates.channels = normalizeChannelPreferences(updates.channels);
+    }
     Object.assign(pref, updates);
+    pref.channels = normalizeChannelPreferences(pref.channels);
     pref.lastModifiedAt = new Date();
     return this.preferenceRepository.save(pref);
   }
@@ -211,13 +253,18 @@ export class PreferenceEnforcer {
   }
 
   /**
-   * Get user's enabled channels
+   * Get user's enabled channels as canonical DeliveryChannel values
    */
   async getEnabledChannels(userId: string): Promise<DeliveryChannel[]> {
     const pref = await this.getPreferences(userId);
-    return Object.keys(pref.channels || {})
-      .filter((ch) => pref.channels[ch as DeliveryChannel])
-      .map((ch) => ch as DeliveryChannel);
+    const normalized = normalizeChannelPreferences(pref.channels);
+    const enabled: DeliveryChannel[] = [];
+    for (const key of Object.values(DeliveryChannel)) {
+      if (normalized[key] === true) {
+        enabled.push(key);
+      }
+    }
+    return enabled;
   }
 
   /**
@@ -257,6 +304,7 @@ export class PreferenceEnforcer {
       [DeliveryChannel.PUSH]: false,
       [DeliveryChannel.WEBHOOK]: false,
       [DeliveryChannel.WEBSOCKET]: false,
+      [DeliveryChannel.SMS]: false,
     };
 
     await this.preferenceRepository.save(pref);
